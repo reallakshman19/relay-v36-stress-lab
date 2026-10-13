@@ -6,6 +6,11 @@ on:
   issue_comment:
     types: [created, edited]
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to project'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -20,7 +25,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: reallakshman19/Common
-          ref: 5017e272d125d179573ebd860cad221641851245
+          ref: 515acd89bd1eb812b90dd87dfee2f03a7afef9e6
           path: common
 
       - name: Set up Python
@@ -31,14 +36,74 @@ jobs:
       - name: Install dependencies
         run: pip install --disable-pip-version-check PyYAML
 
-      - name: Run V3.6 Publisher
+      - name: Route and Run V3.6 Publisher
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PR_NUMBER: ${{ github.event.inputs.pr_number }}
         run: |
-          python common/skills/engineering-pr-delivery-v3.6/scripts/publisher_v36.py \
-            --label common/relay/AIM/V36-STRESS.yaml \
-            --plan common/skills/engineering-pr-delivery-v3.6/plans/V36-1-PLAN-02.yaml \
-            --lab ${{ github.repository }} \
-            --pr 9 \
-            --apply \
-            --confirm-scope "${{ github.repository }}#1"
+          python - << 'EOF'
+          import json, os, subprocess, sys
+
+          event_path = os.environ.get("GITHUB_EVENT_PATH")
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          pr_number = None
+
+          if event_path and os.path.exists(event_path):
+              with open(event_path, "r", encoding="utf-8") as f:
+                  event = json.load(f)
+              if event_name == "pull_request":
+                  pr_number = event.get("pull_request", {}).get("number")
+              elif event_name == "issue_comment":
+                  if event.get("issue", {}).get("pull_request"):
+                      pr_number = event.get("issue", {}).get("number")
+              elif event_name == "workflow_dispatch":
+                  raw_input = event.get("inputs", {}).get("pr_number") or os.environ.get("INPUT_PR_NUMBER")
+                  if raw_input and str(raw_input).strip():
+                      pr_number = int(str(raw_input).strip())
+
+          if pr_number is None and os.environ.get("INPUT_PR_NUMBER"):
+              raw = os.environ["INPUT_PR_NUMBER"].strip()
+              if raw:
+                  pr_number = int(raw)
+
+          repo = os.environ.get("GITHUB_REPOSITORY", "reallakshman19/relay-v36-stress-lab")
+
+          # Dynamic selection of plan, scope, and PR routing:
+          # PR #9 -> controlling parent #1
+          # Workload PRs -> workload parent #8
+          if pr_number == 9:
+              plan = "common/skills/engineering-pr-delivery-v3.6/plans/V36-1-PLAN-02.yaml"
+              scope = f"{repo}#1"
+              pr_args = ["--pr", "9"]
+          elif pr_number is not None:
+              plan = "common/skills/engineering-pr-delivery-v3.6/plans/V36-8-PLAN-01.yaml"
+              scope = f"{repo}#8"
+              pr_args = ["--pr", str(pr_number)]
+          else:
+              issue_num = None
+              if event_path and os.path.exists(event_path):
+                  with open(event_path, "r", encoding="utf-8") as f:
+                      issue_num = json.load(f).get("issue", {}).get("number")
+              if issue_num and issue_num in [1, 2, 3, 4, 5, 6, 7]:
+                  plan = "common/skills/engineering-pr-delivery-v3.6/plans/V36-1-PLAN-02.yaml"
+                  scope = f"{repo}#1"
+                  pr_args = ["--pr", "9"]
+              else:
+                  plan = "common/skills/engineering-pr-delivery-v3.6/plans/V36-8-PLAN-01.yaml"
+                  scope = f"{repo}#8"
+                  pr_args = []
+
+          cmd = [
+              sys.executable,
+              "common/skills/engineering-pr-delivery-v3.6/scripts/publisher_v36.py",
+              "--label", "common/relay/AIM/V36-STRESS.yaml",
+              "--plan", plan,
+              "--lab", repo,
+              "--apply",
+              "--confirm-scope", scope
+          ] + pr_args
+
+          print(f"Routing event '{event_name}' (PR={pr_number}) -> Plan: {plan}, Scope: {scope}")
+          print("Command:", " ".join(cmd))
+          sys.exit(subprocess.call(cmd))
+          EOF
