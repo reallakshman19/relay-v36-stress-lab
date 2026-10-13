@@ -6,6 +6,11 @@ on:
   issue_comment:
     types: [created, edited]
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to project'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -20,7 +25,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: reallakshman19/Common
-          ref: proposal/v36-stress-plan-01
+          ref: 515acd89bd1eb812b90dd87dfee2f03a7afef9e6
           path: common
 
       - name: Set up Python
@@ -31,13 +36,99 @@ jobs:
       - name: Install dependencies
         run: pip install --disable-pip-version-check PyYAML
 
-      - name: Run V3.6 Publisher
+      - name: Route and Run Bounded V3.6 Publisher
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PR_NUMBER: ${{ github.event.inputs.pr_number }}
         run: |
-          python common/skills/engineering-pr-delivery-v3.6/scripts/publisher_v36.py \
-            --label common/relay/AIM/V36-STRESS.yaml \
-            --plan common/skills/engineering-pr-delivery-v3.6/plans/V36-1-PLAN-02.yaml \
-            --lab ${{ github.repository }} \
-            --apply \
-            --confirm-scope "${{ github.repository }}#1"
+          python - << 'EOF'
+          import json, os, subprocess, sys
+          from pathlib import Path
+
+          # Load Common scripts
+          scripts_dir = Path("common/skills/engineering-pr-delivery-v3.6/scripts").resolve()
+          sys.path.insert(0, str(scripts_dir))
+
+          from decompose_v36 import GithubClient, load_plan
+          import lifecycle_v36 as lc
+          import publisher_v36 as pu
+
+          event_path = os.environ.get("GITHUB_EVENT_PATH")
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          event_data = {}
+          if event_path and os.path.exists(event_path):
+              with open(event_path, "r", encoding="utf-8") as f:
+                  event_data = json.load(f)
+
+          # 1. Discover event PR or issue
+          pr_number = None
+          event_issue_number = None
+
+          if event_name == "pull_request":
+              pr_number = event_data.get("pull_request", {}).get("number")
+          elif event_name == "issue_comment":
+              if event_data.get("issue", {}).get("pull_request"):
+                  pr_number = event_data.get("issue", {}).get("number")
+              else:
+                  event_issue_number = event_data.get("issue", {}).get("number")
+          elif event_name == "workflow_dispatch":
+              raw_input = event_data.get("inputs", {}).get("pr_number") or os.environ.get("INPUT_PR_NUMBER")
+              if raw_input and str(raw_input).strip():
+                  pr_number = int(str(raw_input).strip())
+
+          if pr_number is None and os.environ.get("INPUT_PR_NUMBER"):
+              raw = os.environ["INPUT_PR_NUMBER"].strip()
+              if raw:
+                  pr_number = int(raw)
+
+          repo = os.environ.get("GITHUB_REPOSITORY", "reallakshman19/relay-v36-stress-lab")
+          token = os.environ.get("GITHUB_TOKEN")
+          client = GithubClient(repo, token=token)
+          label = lc.load_label("common/relay/AIM/V36-STRESS.yaml")
+
+          # 2. Select plan and scope:
+          # PR #9 -> controlling parent #1
+          # Workload PRs -> workload parent #8
+          if pr_number == 9 or event_issue_number in [1, 2, 3, 4, 5, 6, 7]:
+              plan_file = "common/skills/engineering-pr-delivery-v3.6/plans/V36-1-PLAN-02.yaml"
+              scope = f"{repo}#1"
+              calc_pr = 9 if pr_number == 9 else None
+              parent_no = 1
+          else:
+              plan_file = "common/skills/engineering-pr-delivery-v3.6/plans/V36-8-PLAN-01.yaml"
+              scope = f"{repo}#8"
+              calc_pr = pr_number
+              parent_no = 8
+
+          plan = load_plan(plan_file, label)
+
+          # 3. Authoritative calculation using existing publisher
+          result = pu.calculate(plan, client, pr_number=calc_pr)
+          total_changes = len(result["changes"])
+          print(f"Authoritative publisher calculated {total_changes} total proposed changes across plan.")
+
+          # 4. Scope Bounding: Prevent unpaced bulk writes from GitHub Actions
+          # - PR events: bound strictly to the selected PR title (write count <= 1)
+          # - Issue-comment events: bound to relevant issue, parent, and attributable PR changes only
+          if pr_number is not None:
+              bounded_changes = [c for c in result["changes"] if c.get("kind") == "pr" and c.get("number") == pr_number]
+              print(f"Scoped to PR #{pr_number}: {len(bounded_changes)} change(s) selected (out of {total_changes}).")
+          elif event_issue_number is not None:
+              allowed_numbers = {event_issue_number, parent_no}
+              bounded_changes = [
+                  c for c in result["changes"]
+                  if (c.get("kind") == "issue" and c.get("number") in allowed_numbers)
+                  or (c.get("kind") == "pr")
+              ]
+              print(f"Scoped to Issue #{event_issue_number} & Parent #{parent_no}: {len(bounded_changes)} change(s) selected (out of {total_changes}).")
+          else:
+              bounded_changes = [c for c in result["changes"] if c.get("kind") == "issue" and c.get("number") == parent_no]
+              print(f"Scoped to Parent #{parent_no} only: {len(bounded_changes)} change(s) selected (out of {total_changes}).")
+
+          result["changes"] = bounded_changes
+
+          # 5. Apply bounded projection with exact readback verification
+          applied = pu.apply_projection(result, client, confirm_scope=scope, allow_write=True)
+          print(f"SUMMARY: applied={applied.get('applied', 0)}, proposed={len(bounded_changes)}, readback_ok={applied.get('readback_ok', False)}")
+          print(json.dumps({"projection": {"parent": scope, "changes": bounded_changes}, "write": applied}, indent=2))
+          EOF
